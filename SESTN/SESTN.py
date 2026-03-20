@@ -20,6 +20,7 @@ class ReverseLayerF(Function):
         output = grad_output.neg() * ctx.alpha
         return output, None
 
+
 class FrequenceSqueeze(nn.Module):
     def __init__(self):
         super(FrequenceSqueeze, self).__init__()
@@ -52,7 +53,6 @@ class SpatialExt(nn.Module):
         # 根据c、e维度进行矩阵计算，得到余弦相似度矩阵，通过索引筛选脑区相关通道的邻接矩阵，并与batch维共同计算平均距离
         # 得到超图G(f, c, c)
         G = self.getHyperLap(x, self.EAdj)
-        # G = self.EAdj @ G
         fx = x.permute(2, 0, 1, 3, 4)  # (f, b, s, c, e)
         output = self.hgnn(fx, G)
         output = output.permute(0, 1, 3, 2, 4).reshape(F, B, C, -1)
@@ -150,7 +150,7 @@ class SingleTemporalExt(nn.Module):
 
     def forward(self, x):
         b, s, f, c, e = x.shape
-        fx = x.permute(0, 1, 3, 2, 4).reshape(b, s, c, f*e)  # (f, b, s, c, e) (b, s, f*c, e)性能好
+        fx = x.permute(0, 1, 3, 2, 4).reshape(b, s, c, f * e)  # (f, b, s, c, e) (b, s, f*c, e)性能好
         mambaOut = self.mamba(fx).unsqueeze(1).repeat(1, f, 1, 1)
         mambaOut = self.bn(mambaOut)
         mambaOut = self.TemporalEmb(mambaOut)
