@@ -1,0 +1,1 @@
+代码下载后安装requierments的中库，再将下载的seed系列数据集放入文件夹，运行pretrain进行数据预处理，然后运行train即可训练
