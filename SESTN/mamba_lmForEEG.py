@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mambapy.mambaForEEG import Mamba, MambaConfig, RMSNorm
+from SESTN.mambaForEEG import Mamba, MambaConfig, RMSNorm
 
 """
 

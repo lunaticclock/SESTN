@@ -1,7 +1,7 @@
 import torch.nn as nn
 
-from mambapy.mambaForEEG import Mamba, RMSNorm
-from mambapy.mamba_lmForEEG import MambaLMConfig
+from SESTN.mambaForEEG import Mamba, RMSNorm
+from SESTN.mamba_lmForEEG import MambaLMConfig
 
 
 class MambaLMPara(nn.Module):

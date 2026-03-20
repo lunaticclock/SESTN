@@ -6,8 +6,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mambapy.pscan import pscan
-
 """
 
 This file closely follows the mamba_simple.py from the official Mamba implementation, and the mamba-minimal by @johnma2006.
@@ -69,11 +67,10 @@ class Mamba(nn.Module):
         self.layers = nn.ModuleList([ResidualBlock(config) for _ in range(config.n_layers)])
 
     def forward(self, x):
-        # x : (B, L, C, F)
+        # x : (B, L, D)
 
-        # y : (B, L, C*F)
-        B, L, C, F = x.shape
-        x = x.reshape(B, L, -1)  # (B, L, C*F)
+        # y : (B, L, D)
+
         for layer in self.layers:
             x = layer(x)
 
@@ -100,9 +97,9 @@ class ResidualBlock(nn.Module):
         self.norm = RMSNorm(config.d_model, config.rms_norm_eps)
 
     def forward(self, x):
-        # x : (B, L, C*F)
+        # x : (B, L, D)
 
-        # output : (B, L, C*F)
+        # output : (B, L, D)
 
         output = self.mixer(self.norm(x)) + x
         return output
@@ -202,20 +199,19 @@ class MambaBlock(nn.Module):
         return dt, B, C
 
     def forward(self, x):
-        # x : (B, L, C, F)
+        # x : (B, L, D)
 
-        # y : (B, L, C, F)
+        # y : (B, L, D)
 
-        B, L, CF = x.shape
-        # x = x.view(B, L, C * F) # (B, L, C*F)
+        _, L, _ = x.shape
 
-        xz = self.in_proj(x)  # (B, L, 2*C*EF)
-        x, z = xz.chunk(2, dim=-1)  # (B, L, C*EF), (B, L, C*EF)
+        xz = self.in_proj(x)  # (B, L, 2*ED)
+        x, z = xz.chunk(2, dim=-1)  # (B, L, ED), (B, L, ED)
 
         # x branch
-        x = x.transpose(1, -1)  # (B, C*EF, L)
+        x = x.transpose(1, 2)  # (B, ED, L)
         x = self.conv1d(x)[:, :, :L]  # depthwise convolution over time, with a short filter
-        x = x.transpose(1, 2)  # (B, L, C*EF)
+        x = x.transpose(1, 2)  # (B, L, ED)
 
         x = F.silu(x)
         y = self.ssm(x, z)
@@ -233,10 +229,9 @@ class MambaBlock(nn.Module):
         return output
 
     def ssm(self, x, z):
-        # x : (B, C, EF)
-        # z : (B, S, C, EF)
+        # x : (B, L, ED)
 
-        # y : (B, C, EF)
+        # y : (B, L, ED)
 
         A = -torch.exp(self.A_log.float())  # (ED, N)
         D = self.D.float()
@@ -392,241 +387,6 @@ class MambaBlock(nn.Module):
 
         A = -torch.exp(
             self.A_log.float())  # (ED, N) #todo : ne pas le faire tout le temps, puisque c'est indépendant de la timestep
-        D = self.D.float()
-
-        deltaBC = self.x_proj(x)  # (B, dt_rank+2*N)
-
-        delta, B, C = torch.split(deltaBC, [self.config.dt_rank, self.config.d_state, self.config.d_state],
-                                  dim=-1)  # (B, dt_rank), (B, N), (B, N)
-        delta, B, C = self._apply_layernorms(delta, B, C)
-        delta = F.softplus(self.dt_proj(delta))  # (B, ED)
-
-        deltaA = torch.exp(delta.unsqueeze(-1) * A)  # (B, ED, N)
-        deltaB = delta.unsqueeze(-1) * B.unsqueeze(1)  # (B, ED, N)
-
-        BX = deltaB * (x.unsqueeze(-1))  # (B, ED, N)
-
-        if h is None:
-            h = torch.zeros(x.size(0), self.config.d_inner, self.config.d_state, device=deltaA.device)  # (B, ED, N)
-
-        h = deltaA * h + BX  # (B, ED, N)
-
-        y = (h @ C.unsqueeze(-1)).squeeze(2)  # (B, ED, N) @(B, N, 1) -> (B, ED, 1)
-
-        y = y + D * x
-
-        return y, h
-
-
-class MambaBlock2(nn.Module):
-    def __init__(self, config: MambaConfig):
-        super().__init__()
-
-        self.config = config
-
-        # projects block input from F to 2*ED (two branches)
-        self.in_proj = nn.Linear(config.f_model, 2 * config.d_inner, bias=config.bias)
-
-        self.conv1d = nn.Conv1d(in_channels=config.d_inner * config.c_channels,
-                                out_channels=config.d_inner * config.c_channels,
-                                kernel_size=config.d_conv, bias=config.conv_bias,
-                                groups=config.d_inner * config.c_channels,
-                                padding=config.d_conv - 1)
-
-        # projects x to input-dependent delta, B, C
-        self.x_proj = nn.Linear(config.d_inner, config.dt_rank + 2 * config.d_state, bias=False)
-
-        # projects delta from dt_rank to d_inner
-        self.dt_proj = nn.Linear(config.dt_rank, config.d_inner, bias=True)
-
-        # dt initialization
-        dt_init_std = config.dt_rank ** -0.5 * config.dt_scale
-        if config.dt_init == "constant":
-            nn.init.constant_(self.dt_proj.weight, dt_init_std)
-        elif config.dt_init == "random":
-            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
-        else:
-            raise NotImplementedError
-
-        # delta bias
-        dt = torch.exp(
-            torch.rand(config.d_inner) * (math.log(config.dt_max) - math.log(config.dt_min)) + math.log(config.dt_min)
-        ).clamp(min=config.dt_init_floor)
-        inv_dt = dt + torch.log(
-            -torch.expm1(-dt))  # inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
-        with torch.no_grad():
-            self.dt_proj.bias.copy_(inv_dt)
-
-        # S4D real initialization
-        A = torch.arange(1, config.d_state + 1, dtype=torch.float32).repeat(config.d_inner, 1)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.A_log._no_weight_decay = True
-
-        self.D = nn.Parameter(torch.ones(config.d_inner))
-        self.D._no_weight_decay = True
-
-        # projects block output from ED back to F
-        self.out_proj = nn.Linear(config.d_inner, config.f_model, bias=config.bias)
-
-        if self.config.inner_layernorms:
-            self.dt_layernorm = RMSNorm(self.config.dt_rank, config.rms_norm_eps)
-            self.B_layernorm = RMSNorm(self.config.d_state, config.rms_norm_eps)
-            self.C_layernorm = RMSNorm(self.config.d_state, config.rms_norm_eps)
-        else:
-            self.dt_layernorm = None
-            self.B_layernorm = None
-            self.C_layernorm = None
-
-        if self.config.use_cuda:
-            try:
-                from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
-                self.selective_scan_cuda = selective_scan_fn
-            except ImportError:
-                print("Failed to import mamba_ssm. Falling back to mamba.py.")
-                self.config.use_cuda = False
-
-    def _apply_layernorms(self, dt, B, C):
-        if self.dt_layernorm is not None:
-            dt = self.dt_layernorm(dt)
-        if self.B_layernorm is not None:
-            B = self.B_layernorm(B)
-        if self.C_layernorm is not None:
-            C = self.C_layernorm(C)
-        return dt, B, C
-
-    def forward(self, x):
-        # x : (B, L, C, F)
-
-        # Reshape x to (B, L, C*F)
-        B, L, C, F = x.shape
-        x = x.view(B, L, C * F)
-
-        xz = self.in_proj(x)  # (B, L, 2*ED)
-        x, z = xz.chunk(2, dim=-1)  # (B, L, ED), (B, L, ED)
-
-        # x branch
-        x = x.view(B, L, C, -1).transpose(1, 2).contiguous().view(B, C * -1, L)  # (B, C*ED, L)
-        x = self.conv1d(x)[:, :, :L]  # depthwise convolution over time, with a short filter
-        x = x.view(B, C, -1, L).transpose(1, 3).contiguous().view(B, L, C * -1)  # (B, L, C*ED)
-
-        x = F.silu(x)
-        y = self.ssm(x, z)
-
-        if self.config.use_cuda:
-            output = self.out_proj(y)  # (B, L, F)
-            return output.view(B, L, C, F)  # Reshape back to (B, L, C, F)
-
-        # z branch
-        z = F.silu(z)
-
-        output = y * z
-        output = self.out_proj(output)  # (B, L, F)
-
-        return output.view(B, L, C, F)  # Reshape back to (B, L, C, F)
-
-    def ssm(self, x, z):
-        # x : (B, L, ED)
-
-        # y : (B, L, ED)
-
-        A = -torch.exp(self.A_log.float())  # (ED, N)
-        D = self.D.float()
-
-        deltaBC = self.x_proj(x)  # (B, L, dt_rank+2*N)
-        delta, B, C = torch.split(deltaBC, [self.config.dt_rank, self.config.d_state, self.config.d_state],
-                                  dim=-1)  # (B, L, dt_rank), (B, L, N), (B, L, N)
-        delta, B, C = self._apply_layernorms(delta, B, C)
-        delta = self.dt_proj.weight @ delta.transpose(1, 2)  # (ED, dt_rank) @ (B, L, dt_rank) -> (B, ED, L)
-
-        if self.config.use_cuda:
-            x = x.transpose(1, 2)
-            B = B.transpose(1, 2)
-            C = C.transpose(1, 2)
-            z = z.transpose(1, 2)
-
-            y = self.selective_scan_cuda(x, delta, A, B, C, D, z=z, delta_softplus=True, delta_bias=self.dt_proj.bias.float())
-            y = y.transpose(1, 2)  # (B, L, ED)
-        else:
-            delta = delta.transpose(1, 2)
-            delta = F.softplus(delta + self.dt_proj.bias)
-
-            if self.config.pscan:
-                y = self.selective_scan(x, delta, A, B, C, D)
-            else:
-                y = self.selective_scan_seq(x, delta, A, B, C, D)
-
-        return y
-
-    def selective_scan(self, x, delta, A, B, C, D):
-        deltaA = torch.exp(delta.unsqueeze(-1) * A)  # (B, L, ED, N)
-        deltaB = delta.unsqueeze(-1) * B.unsqueeze(2)  # (B, L, ED, N)
-
-        BX = deltaB * (x.unsqueeze(-1))  # (B, L, ED, N)
-
-        hs = pscan(deltaA, BX)
-
-        y = (hs @ C.unsqueeze(-1)).squeeze(3)  # (B, L, ED, N) @(B, L, N, 1) -> (B, L, ED, 1)
-
-        y = y + D * x
-
-        return y
-
-    def selective_scan_seq(self, x, delta, A, B, C, D):
-        _, L, _ = x.shape
-
-        deltaA = torch.exp(delta.unsqueeze(-1) * A)  # (B, L, ED, N)
-        deltaB = delta.unsqueeze(-1) * B.unsqueeze(2)  # (B, L, ED, N)
-
-        BX = deltaB * (x.unsqueeze(-1))  # (B, L, ED, N)
-
-        h = torch.zeros(x.size(0), self.config.d_inner, self.config.d_state, device=deltaA.device)  # (B, ED, N)
-        hs = []
-
-        for t in range(0, L):
-            h = deltaA[:, t] * h + BX[:, t]
-            hs.append(h)
-
-        hs = torch.stack(hs, dim=1)  # (B, L, ED, N)
-
-        y = (hs @ C.unsqueeze(-1)).squeeze(3)  # (B, L, ED, N) @(B, L, N, 1) -> (B, L, ED, 1)
-
-        y = y + D * x
-
-        return y
-
-    def step(self, x, cache):
-        h, inputs = cache
-
-        xz = self.in_proj(x)  # (B, 2*ED)
-        x, z = xz.chunk(2, dim=1)  # (B, ED), (B, ED)
-
-        x_cache = x.unsqueeze(2)
-        x = self.conv1d(torch.cat([inputs, x_cache], dim=2))[:, :, self.config.d_conv - 1]  # (B, ED)
-
-        x = F.silu(x)
-        y, h = self.ssm_step(x, h)
-
-        # z branch
-        z = F.silu(z)
-
-        output = y * z
-        output = self.out_proj(output)  # (B, D)
-
-        # prepare cache for next call
-        inputs = torch.cat([inputs[:, :, 1:], x_cache], dim=2)  # (B, ED, d_conv-1)
-        cache = (h, inputs)
-
-        return output, cache
-
-    def ssm_step(self, x, h):
-        # x : (B, ED)
-        # h : (B, ED, N)
-
-        # y : (B, ED)
-        # h : (B, ED, N)
-
-        A = -torch.exp(
-            self.A_log.float())  # (ED, N)
         D = self.D.float()
 
         deltaBC = self.x_proj(x)  # (B, dt_rank+2*N)

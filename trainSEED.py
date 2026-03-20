@@ -8,7 +8,7 @@ from torch.nn import Parameter
 from torch.utils.data import TensorDataset, DataLoader
 
 from args import parse_args
-from mambapy.SESTN import HGCNMEmbedPara
+from SESTN.SESTN import HGCNMEmbedPara
 from utils import Timer, convert_dis_m, get_ini_dis_m, return_coordinates, seed_everything, save_checkpoint
 from utils import load_data_de, load_data_inde
 from utils import set_logging_config, CE_Label_Smooth_Loss
